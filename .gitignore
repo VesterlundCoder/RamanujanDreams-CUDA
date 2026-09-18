@@ -1,0 +1,27 @@
+# Compiled binaries
+*.o
+*.cu.o
+cmf_walk_f64
+cmf_walk_rns
+cmf_walk_df64
+
+# Build artifacts
+build/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary results
+/tmp/
+results/individual/
+results/zeta_test/
+slurm-*.out

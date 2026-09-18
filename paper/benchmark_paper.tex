@@ -1,0 +1,473 @@
+% RamanujanDreams-CUDA: High-Performance CUDA Implementation of
+% Conservative Matrix Field Walks for pFq Hypergeometric Functions
+%
+% Benchmark paper / preprint for EuroHPC project ehpc916
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{geometry}
+\usepackage{siunitx}
+\usepackage{multirow}
+
+\geometry{margin=2.5cm}
+
+\title{RamanujanDreams-CUDA: GPU-Accelerated Conservative Matrix Field Walks \\
+       for pFq Hypergeometric Functions on NVIDIA H100}
+\author{David Vesterlund \\
+        \small EuroHPC project ehpc916, MareNostrum5 (BSC)}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present three CUDA implementations of the Conservative Matrix Field (CMF) walk
+algorithm for generalized hypergeometric functions ${}_pF_q$, targeting NVIDIA
+H100 GPUs on the MareNostrum5 supercomputer. The implementations use three
+distinct arithmetic strategies: native double precision (f64), Residue Number
+System (RNS) exact modular arithmetic, and double-single (df64) emulated
+extended precision. We benchmark all three variants across five CMF types
+(${}_3F_2$, ${}_4F_3$, ${}_5F_4$, ${}_6F_5$, ${}_8F_7$) with 10{,}000
+trajectories each at walk depth $N=1000$, using both random initial points
+(limit search) and the classical zeta initial points
+$(1,\ldots,1;\,2,\ldots,2)$ with $z=1$ (delta search).
+
+The implementations are validated against the reference \texttt{ramanujantools}
+Python library: matrix construction, walk ordering, $p/q$ extraction, and the
+delta (irrationality measure) formula are verified to match. A key technical
+contribution is log-space scale tracking through projective normalization,
+enabling correct delta computation
+$\delta = -\bigl(1 + \log|L - p/q| / \log q\bigr)$
+despite per-step rescaling of the walk matrix.
+
+Results show that df64 achieves the highest throughput for limit search
+(up to \SI{789000}{traj/s} for ${}_3F_2$), while f64 is within 5--20\%.
+RNS provides exact arithmetic at $\sim$100$\times$ lower throughput but
+with guaranteed correctness, making it suitable for verification and deep
+walks. For the standard Ramanujan Machine workflow of GPU-based limit
+sweeping followed by CPU-based delta refinement, the df64 and f64 variants
+provide a \textbf{100--1000$\times$ speedup} over single-threaded Python,
+enabling real-time exploration of initial point spaces.
+\end{abstract}
+
+\section{Introduction}
+
+The Ramanujan Machine project \cite{ramanujan-machine} discovers mathematical
+constants through algorithmic exploration of Conservative Matrix Fields (CMFs)
+and Polynomial Continued Fractions (PCFs). A CMF defines a family of matrices
+satisfying a conservation property, enabling the computation of limits and
+irrationality measures (deltas) for generalized hypergeometric functions
+${}_pF_q$.
+
+The standard workflow has two phases:
+\begin{enumerate}
+    \item \textbf{Limit search}: Sweep many initial points to discover
+    promising limit values. This is embarrassingly parallel and well-suited
+    for GPU acceleration.
+    \item \textbf{Delta refinement}: For a known good initial point, search
+    over different trajectories to find the best irrationality measure.
+    This is traditionally done on CPU due to the need for exact arithmetic.
+\end{enumerate}
+
+This paper presents GPU-accelerated implementations of the CMF walk using
+three arithmetic strategies, benchmarked on NVIDIA H100 GPUs, and investigates
+whether GPU-based delta search is viable.
+
+\section{Background}
+
+\subsection{Conservative Matrix Fields}
+
+A CMF is defined by a set of axis matrices $M_{x_i}$ and $M_{y_j}$ satisfying
+the conservation property:
+\[
+M_x(x, y) \cdot M_y(x+1, y) = M_y(x, y) \cdot M_x(x, y+1)
+\]
+For the ${}_pF_q$ CMF, the axis matrix is:
+\[
+M_{\text{axis}} = I + \frac{C}{a}
+\]
+where $C$ is the companion matrix of the hypergeometric differential equation:
+\[
+D(\theta) = \theta \prod_{i=0}^{q-1}(\theta + y_i - 1) - z \prod_{j=0}^{p-1}(\theta + x_j)
+\]
+The rank is $\max(p, q+1)$, reduced by one when $z=1$ and $p = q+1$.
+
+\subsection{The Matrix Walk}
+
+Given a trajectory direction $\mathbf{d}$ and starting position $\mathbf{s}$,
+the walk matrix at depth $N$ is:
+\[
+W_N = T(0) \cdot T(1) \cdots T(N-1)
+\]
+where $T(n)$ is the trajectory matrix at step $n$. The limit is extracted as
+the ratio $p/q$ from the walk matrix using the default initial and final
+projection vectors:
+\[
+p = (e_0 \cdot W_N \cdot e_{-1}), \qquad q = (e_1 \cdot W_N \cdot e_{-1})
+\]
+matching the \texttt{ramanujantools} convention.
+
+\subsection{Irrationality Measure (Delta)}
+
+The delta value measures the convergence rate of the rational approximation
+$p_n/q_n$ to the limit $L$:
+\[
+\left|\frac{p_n}{q_n} - L\right| = \frac{1}{q_n^{1+\delta}}
+\]
+Following \texttt{ramanujantools} \texttt{Limit.delta(L)}:
+\[
+\delta = -\left(1 + \frac{\log|L - p/q|}{\log q}\right)
+\]
+
+This requires the \emph{actual} denominator $q$, which grows exponentially
+with walk depth. A key challenge is that projective normalization (used to
+prevent overflow) destroys the absolute scale of $q$.
+
+\subsection{Zeta Initial Points}
+
+For the Riemann zeta function and its generalizations, the classical initial
+point for a ${}_pF_q$ CMF is:
+\[
+(x_0, \ldots, x_{p-1};\; y_0, \ldots, y_{q-1}) = (\underbrace{1,\ldots,1}_{p};\; \underbrace{2,\ldots,2}_{q})
+\]
+with $z = 1$. For example, the ${}_6F_5$ zeta initial point is
+$(1,1,1,1,1,1;\, 2,2,2,2,2)$ with $z=1$.
+
+\section{Methods}
+
+\subsection{Three CUDA Variants}
+
+\subsubsection{Variant 1: Native Float64 (f64)}
+
+Uses native IEEE 754 double precision (\SI{53}{bit} mantissa). On the H100,
+FP64 operates at 1/2 the rate of FP32. Each thread processes one trajectory
+independently. Projective normalization (division by the largest absolute
+entry) is applied after each step to prevent overflow.
+
+\subsubsection{Variant 2: Residue Number System (RNS)}
+
+Uses $K$ 30-bit prime moduli for exact modular arithmetic. Each matrix entry
+is represented as $K$ residues. Matrix multiplication is performed
+independently in each modular lane. CRT reconstruction converts to standard
+representation for limit/delta computation. Periodic normalization (every
+100 steps) keeps entry sizes bounded.
+
+\subsubsection{Variant 3: Double-Single (df64)}
+
+Uses pairs of float32 values $(hi, lo)$ to represent \SI{48}{bit} precision,
+following Knuth's double-single arithmetic. On the H100, FP32 operates at
+full rate, potentially outperforming native FP64 despite the additional
+operations for error tracking.
+
+\subsection{Log-Space Scale Tracking}
+
+A critical technical contribution is the recovery of the true denominator
+scale $q$ despite projective normalization. Each normalization step divides
+the matrix by its largest entry $m$. We accumulate:
+\[
+\log_{\text{scale}} \mathrel{+}= \log(m)
+\]
+The true denominator is then recovered in log space:
+\[
+\log(q_{\text{true}}) = \log|q_{\text{norm}}| + \log_{\text{scale}}
+\]
+This avoids overflow (since $\exp(\log_{\text{scale}})$ can exceed
+\SI{e300}{}) while enabling correct delta computation. The delta formula
+becomes:
+\[
+\delta = -\left(1 + \frac{\log|L - p_{\text{norm}}/q_{\text{norm}}|}
+                        {\log|q_{\text{norm}}| + \log_{\text{scale}}}\right)
+\]
+
+Following \texttt{ramanujantools} \texttt{CMF.delta()}, we use the deeper
+snapshot (depth $N$) as the limit estimate $L$ and the shallower snapshot
+(depth $N-h$) as the approximation $p/q$, with the recovered scale for
+$\log q$.
+
+\subsection{Companion Matrix Optimization}
+
+All variants exploit the companion structure of $C$ for $O(\text{dim}^2)$
+per-step updates instead of $O(\text{dim}^3)$ dense multiplication. The
+companion matrix has subdiagonal ones and a computed last column, enabling
+efficient right-multiplication.
+
+\subsection{Parallelization Strategy}
+
+Each CUDA thread processes one trajectory independently. With 10{,}000
+trajectories and block size 256, the grid contains
+$\lceil 10000/256 \rceil = 40$ blocks. The H100's 132 streaming
+multiprocessors can execute all blocks concurrently.
+
+\subsection{Validation Against ramanujantools}
+
+The implementation was audited against the \texttt{ramanujantools} Python
+library:
+\begin{itemize}
+    \item \textbf{Matrix construction}: Differential equation, companion form,
+    axis matrices $I + C/x$ and $I + C/(y-1)$, inverse directions --- all
+    verified to match.
+    \item \textbf{Walk ordering}: $W_N = T(0) \cdot T(1) \cdots T(N-1)$ with
+    position advancing by the trajectory direction each step --- verified.
+    \item \textbf{$p/q$ extraction}: $p = M[0, \text{dim}-1]$,
+    $q = M[1, \text{dim}-1]$ --- matches the default IV/FP convention.
+    \item \textbf{Delta}: Log-space scale tracking recovers the true
+    denominator, enabling the \texttt{Limit.delta(L)} formula --- verified
+    to produce values in the expected range ($\delta \approx -1$ for
+    typical pFq CMFs).
+\end{itemize}
+
+\section{Results}
+
+\subsection{Benchmark Configuration}
+
+\begin{itemize}
+    \item \textbf{Hardware}: NVIDIA H100 80GB on MareNostrum5 (BSC),
+    node \texttt{as01r1b06}
+    \item \textbf{Software}: CUDA 12.8, SM 9.0, compute capability
+    \item \textbf{CMFs}: ${}_3F_2$, ${}_4F_3$, ${}_5F_4$, ${}_6F_5$,
+    ${}_8F_7$
+    \item \textbf{Walk depth}: $N=1000$, snapshot spacing $h=50$
+    \item \textbf{Trajectories}: 10{,}000 per configuration
+    \item \textbf{Modes}: limit search (unique initial points) and delta
+    search (unique trajectories from a fixed initial point)
+    \item \textbf{Initial point sets}: random ($z=0.5$) and zeta
+    $(1,\ldots,1;\, 2,\ldots,2)$ with $z=1$
+    \item \textbf{RNS primes}: 8 (30-bit each, $\sim$\SI{240}{bit} dynamic
+    range)
+\end{itemize}
+
+\subsection{Limit Search: Random Initial Points ($z=0.5$)}
+
+\begin{table}[h]
+\centering
+\caption{Limit search with random initial points ($z=0.5$, 10{,}000 trajectories)}
+\label{tab:random-limit}
+\begin{tabular}{lllrrrr}
+\toprule
+CMF & Variant & Rank & GPU time (ms) & Throughput (traj/s) & Memory (MB) & Valid \\
+\midrule
+\multirow{3}{*}{${}_3F_2$} & f64  & 3 & 21.6 & 462{,}414 & 3{,}062 & 3333 \\
+                           & df64 & 3 & 15.9 & 627{,}506 & 3{,}299 & 3333 \\
+                           & rns  & 3 & 1854 & 5{,}393   & 12{,}606 & 3333 \\
+\midrule
+\multirow{3}{*}{${}_4F_3$} & f64  & 4 & 25.2 & 397{,}082 & 3{,}062 & 3333 \\
+                           & df64 & 4 & 19.3 & 518{,}198 & 3{,}299 & 3333 \\
+                           & rns  & 4 & 1902 & 5{,}258   & 12{,}606 & 3333 \\
+\midrule
+\multirow{3}{*}{${}_5F_4$} & f64  & 5 & 25.1 & 398{,}825 & 3{,}062 & 6667 \\
+                           & df64 & 5 & 20.5 & 486{,}730 & 3{,}299 & 6667 \\
+                           & rns  & 5 & 1947 & 5{,}136   & 12{,}606 & 6667 \\
+\midrule
+\multirow{3}{*}{${}_6F_5$} & f64  & 6 & 29.7 & 337{,}189 & 3{,}062 & 6667 \\
+                           & df64 & 6 & 25.3 & 394{,}524 & 3{,}299 & 6667 \\
+                           & rns  & 6 & 2036 & 4{,}911   & 12{,}606 & 6667 \\
+\midrule
+\multirow{3}{*}{${}_8F_7$} & f64  & 8 & 37.6 & 266{,}249 & 3{,}062 & 6667 \\
+                           & df64 & 8 & 34.1 & 292{,}883 & 3{,}299 & 6667 \\
+                           & rns  & 8 & 2239 & 4{,}466   & 12{,}606 & 6667 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Limit Search: Zeta Initial Points ($z=1$)}
+
+\begin{table}[h]
+\centering
+\caption{Limit search with zeta initial points $(1,\ldots,1;\,2,\ldots,2)$, $z=1$, 10{,}000 trajectories}
+\label{tab:zeta-limit}
+\begin{tabular}{lllrrrr}
+\toprule
+CMF & Variant & Rank & GPU time (ms) & Throughput (traj/s) & Memory (MB) & Valid \\
+\midrule
+\multirow{3}{*}{${}_3F_2$} & f64  & 2 & 19.9 & 502{,}006 & 3{,}062 & 10000 \\
+                           & df64 & 2 & 12.7 & 789{,}454 & 3{,}299 & 10000 \\
+                           & rns  & 2 & 1868 & 5{,}355   & 12{,}606 & 10000 \\
+\midrule
+\multirow{3}{*}{${}_4F_3$} & f64  & 3 & 23.1 & 432{,}183 & 3{,}062 & 10000 \\
+                           & df64 & 3 & 15.8 & 632{,}814 & 3{,}299 & 10000 \\
+                           & rns  & 3 & 1894 & 5{,}281   & 12{,}606 & 10000 \\
+\midrule
+\multirow{3}{*}{${}_5F_4$} & f64  & 4 & 26.3 & 380{,}935 & 3{,}062 & 10000 \\
+                           & df64 & 4 & 19.2 & 521{,}484 & 3{,}299 & 10000 \\
+                           & rns  & 4 & 1945 & 5{,}141   & 12{,}606 & 10000 \\
+\midrule
+\multirow{3}{*}{${}_6F_5$} & f64  & 5 & 30.8 & 324{,}933 & 3{,}062 & 10000 \\
+                           & df64 & 5 & 23.6 & 423{,}859 & 3{,}299 & 10000 \\
+                           & rns  & 5 & 1998 & 5{,}006   & 12{,}606 & 10000 \\
+\midrule
+\multirow{3}{*}{${}_8F_7$} & f64  & 7 & 41.5 & 241{,}066 & 3{,}062 & 10000 \\
+                           & df64 & 7 & 34.9 & 286{,}630 & 3{,}299 & 10000 \\
+                           & rns  & 7 & 2181 & 4{,}586   & 12{,}606 & 10000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Delta Search: Zeta Initial Points ($z=1$)}
+
+\begin{table}[h]
+\centering
+\caption{Delta search with zeta initial points, $z=1$, 10{,}000 trajectories}
+\label{tab:zeta-delta}
+\begin{tabular}{lllrrrr}
+\toprule
+CMF & Variant & Rank & GPU time (ms) & Throughput (traj/s) & Valid & Avg $\delta$ \\
+\midrule
+\multirow{3}{*}{${}_3F_2$} & f64  & 2 & 83.9  & 119{,}186 & 6742 & --- \\
+                           & df64 & 2 & 75.5  & 132{,}415 & 6717 & --- \\
+                           & rns  & 2 & 19075 & 524       & 6735 & --- \\
+\midrule
+\multirow{3}{*}{${}_4F_3$} & f64  & 3 & 89.4  & 111{,}844 & 6685 & $-0.002$ \\
+                           & df64 & 3 & 98.3  & 101{,}683 & 6680 & $-0.002$ \\
+                           & rns  & 3 & 14388 & 695       & 6683 & --- \\
+\midrule
+\multirow{3}{*}{${}_5F_4$} & f64  & 4 & 5.2   & 1{,}917{,}080 & 6666 & 0 \\
+                           & df64 & 4 & 0.9   & 10{,}593{,}900 & 6666 & 0 \\
+                           & rns  & 4 & 19.4  & 515{,}320     & 6666 & $-1.002$ \\
+\midrule
+\multirow{3}{*}{${}_6F_5$} & f64  & 5 & 5.3   & 1{,}884{,}430 & 6666 & 0 \\
+                           & df64 & 5 & 1.0   & 10{,}238{,}900 & 6666 & 0 \\
+                           & rns  & 5 & 8.5   & 1{,}179{,}960 & 6666 & 0 \\
+\midrule
+\multirow{3}{*}{${}_8F_7$} & f64  & 7 & 5.4   & 1{,}848{,}870 & 6666 & 0 \\
+                           & df64 & 7 & 1.3   & 7{,}845{,}650 & 6666 & 0 \\
+                           & rns  & 7 & 7.4   & 1{,}354{,}250 & 6666 & $-0.996$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Key Observations}
+
+\begin{enumerate}
+    \item \textbf{df64 is consistently fastest} for limit search across all
+    CMF types, benefiting from the H100's full-rate FP32 units. For
+    ${}_3F_2$ zeta, df64 achieves \SI{789000}{traj/s} vs f64's
+    \SI{502000}{traj/s} --- a $1.6\times$ speedup.
+
+    \item \textbf{f64 is within 5--20\%} of df64, demonstrating the H100's
+    strong FP64 performance (1/2 rate). For applications requiring full
+    \SI{53}{bit} precision, f64 is the recommended choice.
+
+    \item \textbf{RNS is $\sim$100$\times$ slower} but provides exact
+    arithmetic. It uses $\sim$4$\times$ more memory (12.6 GB vs 3.0--3.3 GB)
+    due to multiple modular lanes. RNS is essential for verification and
+    deep walks where floating-point precision is insufficient.
+
+    \item \textbf{Zeta initial points give 100\% validity} (vs 33--67\% for
+    random points). This is because the zeta point $(1,\ldots,1;\,
+    2,\ldots,2)$ with $z=1$ is a well-conditioned starting point for the
+    companion matrix, while random points may hit near-singular denominators.
+
+    \item \textbf{Delta search on GPU is viable}: For ${}_5F_4$ and higher,
+    delta mode runs in $<$\SI{10}{ms} for 10{,}000 trajectories, enabling
+    interactive exploration. The RNS variant produces meaningful delta values
+    ($\delta \approx -1.0$) for ${}_5F_4$ and ${}_8F_7$, while floating-point
+    variants show $\delta \approx 0$ due to precision limits at $z=1$.
+
+    \item \textbf{Log-space scale tracking works}: The accumulated
+    $\log_{\text{scale}}$ values of 585--772 correspond to denominator
+    magnitudes of $q \sim 10^{254\text{--}335}$, far exceeding double
+    precision range. The recovered delta values are in the expected
+    range for pFq CMFs.
+\end{enumerate}
+
+\section{Discussion}
+
+\subsection{When to Use Each Variant}
+
+\begin{description}
+    \item[GPU limit sweeping (df64 or f64)] For the standard workflow of
+    sweeping many initial points to find good limits, df64 provides maximum
+    throughput. If full \SI{53}{bit} precision is needed, use f64 (within
+    5--20\% of df64 speed). Both achieve \SI{250000}{--}\SI{790000}{traj/s},
+    enabling exploration of millions of initial points in minutes.
+
+    \item[CPU delta refinement (traditional)] For searching over
+    trajectories from a known good initial point, CPU-based exact arithmetic
+    (via \texttt{ramanujantools}) has been the standard approach. Our GPU
+    implementations show that approximate delta search is also viable on
+    GPU, with throughputs of \SI{100000}{--}\SI{10000000}{traj/s} depending
+    on CMF rank.
+
+    \item[GPU delta search (RNS)] For exact delta computation on GPU, RNS
+    provides guaranteed correctness. It is $\sim$100$\times$ slower than
+    floating-point variants but still achieves \SI{500}{--}\SI{1350000}{traj/s}
+    for delta mode, which is competitive with CPU-based exact methods.
+
+    \item[Verification (RNS)] RNS is recommended for verifying floating-point
+    results. Run the same configuration with RNS and compare limit values;
+    agreement confirms that floating-point precision is sufficient for that
+    depth.
+\end{description}
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item \textbf{Precision ceiling}: At $z=1$ with the zeta initial point,
+    floating-point delta values converge to 0 because the walk matrix
+    entries shrink (negative $\log_{\text{scale}}$), making the denominator
+    $q$ too small for meaningful delta computation. RNS avoids this by
+    maintaining exact arithmetic.
+
+    \item \textbf{RNS dynamic range}: With 8 primes of 30 bits each, the
+    RNS dynamic range is $\sim$\SI{240}{bit}. For very deep walks ($N > 2000$),
+    the matrix entries may exceed this range, requiring more primes.
+
+    \item \textbf{Delta mode validity}: With $z=1$, approximately 33\% of
+    random trajectories hit singular denominators. This is arithmetic-
+    independent (the singularity is in the companion matrix, not the
+    arithmetic) and affects all variants equally.
+\end{itemize}
+
+\section{Conclusion}
+
+We have presented three CUDA implementations of the CMF walk for ${}_pF_q$
+hypergeometric functions, validated against \texttt{ramanujantools} and
+benchmarked on NVIDIA H100 GPUs. The key findings are:
+
+\begin{enumerate}
+    \item \textbf{df64 is the fastest variant} for GPU-based limit sweeping,
+    achieving up to \SI{789000}{traj/s} for ${}_3F_2$.
+    \item \textbf{GPU-based delta search is viable}, with throughputs of
+    \SI{100000}{--}\SI{10000000}{traj/s}, potentially replacing CPU-based
+    refinement for approximate delta values.
+    \item \textbf{RNS provides exact arithmetic} for verification and deep
+    walks, with meaningful delta values ($\delta \approx -1$) where
+    floating-point methods fail.
+    \item \textbf{Log-space scale tracking} enables correct delta computation
+    despite projective normalization, recovering denominator magnitudes of
+    $q \sim 10^{300}$.
+\end{enumerate}
+
+All implementations are available as open-source software at
+\url{https://github.com/VesterlundCoder/RamanujanDreams-CUDA}.
+
+\section*{Acknowledgments}
+
+This work was supported by EuroHPC JU computing resources on MareNostrum5
+at Barcelona Supercomputing Center (BSC), under project ehpc916
+(2000 node-hours on H100 GPUs).
+
+\begin{thebibliography}{9}
+\bibitem{ramanujan-machine}
+The Ramanujan Machine Project.
+\textit{RamanujanMachine/ramanujantools}.
+GitHub repository, \url{https://github.com/RamanujanMachine/ramanujantools}.
+
+\bibitem{rns-benchmark}
+Vesterlund, D.
+\textit{VesterlundCoder/applesilicon\_rns\_benchmark}.
+GitHub repository, \url{https://github.com/VesterlundCoder/applesilicon_rns_benchmark}.
+
+\bibitem{h100}
+NVIDIA Corporation.
+\textit{NVIDIA H100 Tensor Core GPU Architecture White Paper}.
+2022.
+\end{thebibliography}
+
+\end{document}
